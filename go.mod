@@ -1,4 +1,4 @@
-module discord-ai-bot
+module openruntimes/handler
 
 go 1.23.0
 
