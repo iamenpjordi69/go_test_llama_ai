@@ -1,0 +1,13 @@
+# Credentials
+.env
+*.env
+
+# Python environment
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Logs
+*.log
