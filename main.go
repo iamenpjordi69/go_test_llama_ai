@@ -13,14 +13,16 @@ import (
 	"time"
 
 	"github.com/appwrite/sdk-for-go/appwrite"
+	"github.com/appwrite/sdk-for-go/client"
+	"github.com/appwrite/sdk-for-go/databases"
 	"github.com/appwrite/sdk-for-go/query"
 	"github.com/bwmarrin/discordgo"
 	"github.com/open-runtimes/types-for-go/v4/openruntimes"
 )
 
 var (
-	appClient  appwrite.Client
-	databases  *appwrite.Databases
+	appClient client.Client
+	dbService *databases.Databases
 	groqKey    string
 	publicKey  string
 	myUserID   string
@@ -58,7 +60,7 @@ func initialize() {
 			appwrite.WithProject(projectID),
 			appwrite.WithKey(apiKey),
 		)
-		databases = appwrite.NewDatabases(appClient)
+		dbService = appwrite.NewDatabases(appClient)
 	})
 }
 
@@ -119,13 +121,14 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 
 			if !isOwner {
 				// 1. Check Global Ban & Authorisation
-				userDocs, err := databases.ListDocuments(dbID, "users", []string{query.Equal("user_id", userID)})
+				userDocs, err := dbService.ListDocuments(dbID, "users", []string{query.Equal("user_id", userID)})
 				isBanned := false
 				isAuthorised := false
 				if err == nil && len(userDocs.Documents) > 0 {
-					doc := userDocs.Documents[0]
-					isBanned, _ = doc.Data["banned"].(bool)
-					isAuthorised, _ = doc.Data["authorised"].(bool)
+					var data map[string]interface{}
+					userDocs.Documents[0].Decode(&data)
+					isBanned, _ = data["banned"].(bool)
+					isAuthorised, _ = data["authorised"].(bool)
 				} else if err != nil {
 					Context.Error("Database error (users): " + err.Error())
 				}
@@ -141,10 +144,12 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 						return ephemeralResponse(Context, "❌ You are not authorised to use this bot as a personal app.")
 					}
 				} else {
-					guildDocs, err := databases.ListDocuments(dbID, "servers", []string{query.Equal("guild_id", interaction.GuildID)})
+					guildDocs, err := dbService.ListDocuments(dbID, "servers", []string{query.Equal("guild_id", interaction.GuildID)})
 					isActive := false
 					if err == nil && len(guildDocs.Documents) > 0 {
-						isActive, _ = guildDocs.Documents[0].Data["active"].(bool)
+						var data map[string]interface{}
+						guildDocs.Documents[0].Decode(&data)
+						isActive, _ = data["active"].(bool)
 					} else if err != nil {
 						Context.Error("Database error (servers): " + err.Error())
 					}
@@ -203,9 +208,9 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 			if !isOwner { return ephemeralResponse(Context, "❌ Owner ONLY command.") }
 			targetUser := data.Options[0].UserValue(nil)
 			// For unban, we fetch the document ID to delete it
-			docs, err := databases.ListDocuments(dbID, "users", []string{query.Equal("user_id", targetUser.ID)})
+			docs, err := dbService.ListDocuments(dbID, "users", []string{query.Equal("user_id", targetUser.ID)})
 			if err == nil && len(docs.Documents) > 0 {
-				_, err = databases.DeleteDocument(dbID, "users", docs.Documents[0].Id)
+				_, err = dbService.DeleteDocument(dbID, "users", docs.Documents[0].Id)
 				if err != nil {
 					Context.Error("Failed to delete user doc: " + err.Error())
 				}
@@ -218,9 +223,9 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 }
 
 func upsertDocument(Context openruntimes.Context, db, col, keyVal string, data map[string]interface{}, keyName string) {
-	docs, err := databases.ListDocuments(db, col, []string{query.Equal(keyName, keyVal)})
+	docs, err := dbService.ListDocuments(db, col, []string{query.Equal(keyName, keyVal)})
 	if err == nil && len(docs.Documents) > 0 {
-		_, err = databases.UpdateDocument(db, col, docs.Documents[0].Id, data)
+		_, err = dbService.UpdateDocument(db, col, docs.Documents[0].Id, data)
 		if err != nil {
 			Context.Error("UpdateDocument Error ["+col+"]: " + err.Error())
 		}
@@ -228,7 +233,7 @@ func upsertDocument(Context openruntimes.Context, db, col, keyVal string, data m
 		if err != nil && !strings.Contains(err.Error(), "404") {
 			Context.Error("ListDocuments Error ["+col+"]: " + err.Error())
 		}
-		_, err = databases.CreateDocument(db, col, "unique()", data)
+		_, err = dbService.CreateDocument(db, col, "unique()", data)
 		if err != nil {
 			Context.Error("CreateDocument Error ["+col+"]: " + err.Error())
 		}

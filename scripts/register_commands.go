@@ -21,15 +21,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	appID := "" // Will be fetched from state
-	err = dg.Open()
+	// Fetch App ID without opening the gateway (REST only)
+	user, err := dg.User("@me")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to fetch bot info: %v", err)
 	}
-	defer dg.Close()
-
-	appID = dg.State.User.ID
-	fmt.Printf("Registering commands for Bot ID: %s\n", appID)
+	appID := user.ID
+	fmt.Printf("Registering commands for Bot ID: %s (%s)\n", appID, user.Username)
 
 	guildInstall := discordgo.ApplicationIntegrationType(0)
 	userInstall := discordgo.ApplicationIntegrationType(1)
