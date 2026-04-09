@@ -2,7 +2,6 @@ package handler
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -13,42 +12,54 @@ import (
 	"sync"
 	"time"
 
+	"github.com/appwrite/sdk-for-go/appwrite"
+	"github.com/appwrite/sdk-for-go/query"
 	"github.com/bwmarrin/discordgo"
 	"github.com/open-runtimes/types-for-go/v4/openruntimes"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var (
-	dbClient   *mongo.Client
-	channelCol *mongo.Collection
-	userCol    *mongo.Collection
+	appClient  appwrite.Client
+	databases  *appwrite.Databases
 	groqKey    string
 	publicKey  string
 	myUserID   string
+	dbID       string
 	once       sync.Once
 )
 
-func initialize() error {
-	var err error
+func initialize() {
 	once.Do(func() {
 		groqKey = os.Getenv("GROQ_API_KEY")
 		publicKey = os.Getenv("DISCORD_PUBLIC_KEY")
 		myUserID = os.Getenv("MY_USER_ID")
-		mongoURI := os.Getenv("MONGO_URI")
-
-		if mongoURI != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			dbClient, err = mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
-			if err == nil {
-				db := dbClient.Database("discord_bot")
-				channelCol = db.Collection("permitted_channels")
-				userCol = db.Collection("users")
-			}
+		dbID = os.Getenv("APPWRITE_DATABASE_ID")
+		if dbID == "" {
+			dbID = "go_test_db" // Fallback
 		}
+
+		endpoint := os.Getenv("APPWRITE_FUNCTION_ENDPOINT")
+		if endpoint == "" {
+			endpoint = "https://cloud.appwrite.io/v1"
+		}
+
+		projectID := os.Getenv("APPWRITE_FUNCTION_PROJECT_ID")
+		if projectID == "" {
+			projectID = os.Getenv("PROJECT_ID")
+		}
+
+		apiKey := os.Getenv("APPWRITE_FUNCTION_API_KEY")
+		if apiKey == "" {
+			apiKey = os.Getenv("API_KEY")
+		}
+
+		appClient = appwrite.NewClient(
+			appwrite.WithEndpoint(endpoint),
+			appwrite.WithProject(projectID),
+			appwrite.WithKey(apiKey),
+		)
+		databases = appwrite.NewDatabases(appClient)
 	})
-	return err
 }
 
 func verifySignature(signature, timestamp, body, pubKeyHex string) bool {
@@ -70,10 +81,7 @@ func verifySignature(signature, timestamp, body, pubKeyHex string) bool {
 }
 
 func Main(Context openruntimes.Context) openruntimes.Response {
-	if err := initialize(); err != nil {
-		Context.Error("Initialization failed: " + err.Error())
-		return Context.Res.Json(map[string]string{"error": "Initialization failed"}, Context.Res.WithStatusCode(500))
-	}
+	initialize()
 
 	headers := Context.Req.Headers
 	signature := headers["x-signature-ed25519"]
@@ -86,6 +94,7 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 
 	var interaction discordgo.Interaction
 	if err := json.Unmarshal([]byte(body), &interaction); err != nil {
+		Context.Error("Failed to unmarshal interaction: " + err.Error())
 		return Context.Res.Text("Invalid payload", Context.Res.WithStatusCode(400))
 	}
 
@@ -109,25 +118,37 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 			question := data.Options[0].StringValue()
 
 			if !isOwner {
-				// 1. Check Global Ban
-				var userRecord map[string]interface{}
-				userCol.FindOne(context.TODO(), map[string]string{"user_id": userID}).Decode(&userRecord)
-				if banned, _ := userRecord["banned"].(bool); banned {
+				// 1. Check Global Ban & Authorisation
+				userDocs, err := databases.ListDocuments(dbID, "users", []string{query.Equal("user_id", userID)})
+				isBanned := false
+				isAuthorised := false
+				if err == nil && len(userDocs.Documents) > 0 {
+					doc := userDocs.Documents[0]
+					isBanned, _ = doc.Data["banned"].(bool)
+					isAuthorised, _ = doc.Data["authorised"].(bool)
+				} else if err != nil {
+					Context.Error("Database error (users): " + err.Error())
+				}
+
+				if isBanned {
 					return ephemeralResponse(Context, "❌ You have been banned from using this bot.")
 				}
 
 				// 2. Check Activation
 				isPrivate := interaction.GuildID == ""
 				if isPrivate {
-					// User App Context (DM/Private)
-					if authorised, _ := userRecord["authorised"].(bool); !authorised {
-						return ephemeralResponse(Context, "❌ You are not authorised to use this bot as a personal app. Contact the owner.")
+					if !isAuthorised {
+						return ephemeralResponse(Context, "❌ You are not authorised to use this bot as a personal app.")
 					}
 				} else {
-					// Server Context
-					var guildRecord map[string]interface{}
-					err := channelCol.FindOne(context.TODO(), map[string]string{"guild_id": interaction.GuildID}).Decode(&guildRecord)
-					if err != nil || (!guildRecord["active"].(bool)) {
+					guildDocs, err := databases.ListDocuments(dbID, "servers", []string{query.Equal("guild_id", interaction.GuildID)})
+					isActive := false
+					if err == nil && len(guildDocs.Documents) > 0 {
+						isActive, _ = guildDocs.Documents[0].Data["active"].(bool)
+					} else if err != nil {
+						Context.Error("Database error (servers): " + err.Error())
+					}
+					if !isActive {
 						return ephemeralResponse(Context, "❌ This server is not activated. Ask the owner to run `/activate`.")
 					}
 				}
@@ -143,12 +164,14 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 
 		case "activate", "deactivate":
 			if !isOwner { return ephemeralResponse(Context, "❌ Owner ONLY command.") }
-			if interaction.GuildID == "" { return ephemeralResponse(Context, "❌ This command must be used in a server.") }
+			if interaction.GuildID == "" { return ephemeralResponse(Context, "❌ Use in a server.") }
 			active := data.Name == "activate"
-			channelCol.UpdateOne(context.TODO(),
-				map[string]string{"guild_id": interaction.GuildID},
-				map[string]interface{}{"$set": map[string]interface{}{"active": active}},
-				options.Update().SetUpsert(true))
+			
+			upsertDocument(Context, dbID, "servers", interaction.GuildID, map[string]interface{}{
+				"guild_id": interaction.GuildID,
+				"active":   active,
+			}, "guild_id")
+
 			msg := "✅ Server Activated."
 			if !active { msg = "❌ Server Deactivated." }
 			return ephemeralResponse(Context, msg)
@@ -156,33 +179,60 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 		case "authorise", "deauthorise":
 			if !isOwner { return ephemeralResponse(Context, "❌ Owner ONLY command.") }
 			targetUser := data.Options[0].UserValue(nil)
-			authorised := data.Name == "authorise"
-			userCol.UpdateOne(context.TODO(),
-				map[string]string{"user_id": targetUser.ID},
-				map[string]interface{}{"$set": map[string]interface{}{"authorised": authorised}},
-				options.Update().SetUpsert(true))
-			msg := fmt.Sprintf("✅ User %s authorised for personal use.", targetUser.Username)
-			if !authorised { msg = fmt.Sprintf("❌ User %s deauthorised.", targetUser.Username) }
+			auth := data.Name == "authorise"
+			
+			upsertDocument(Context, dbID, "users", targetUser.ID, map[string]interface{}{
+				"user_id":    targetUser.ID,
+				"authorised": auth,
+			}, "user_id")
+
+			msg := fmt.Sprintf("✅ User %s authorised.", targetUser.Username)
+			if !auth { msg = fmt.Sprintf("❌ User %s deauthorised.", targetUser.Username) }
 			return ephemeralResponse(Context, msg)
 
 		case "ban":
 			if !isOwner { return ephemeralResponse(Context, "❌ Owner ONLY command.") }
 			targetUser := data.Options[0].UserValue(nil)
-			userCol.UpdateOne(context.TODO(),
-				map[string]string{"user_id": targetUser.ID},
-				map[string]interface{}{"$set": map[string]interface{}{"banned": true}},
-				options.Update().SetUpsert(true))
-			return ephemeralResponse(Context, fmt.Sprintf("⛔ User %s has been GLOBALLY BANNED.", targetUser.Username))
+			upsertDocument(Context, dbID, "users", targetUser.ID, map[string]interface{}{
+				"user_id": targetUser.ID,
+				"banned":  true,
+			}, "user_id")
+			return ephemeralResponse(Context, fmt.Sprintf("⛔ User %s BANNED.", targetUser.Username))
 
 		case "unban":
 			if !isOwner { return ephemeralResponse(Context, "❌ Owner ONLY command.") }
 			targetUser := data.Options[0].UserValue(nil)
-			userCol.DeleteOne(context.TODO(), map[string]string{"user_id": targetUser.ID})
-			return ephemeralResponse(Context, fmt.Sprintf("✅ User %s has been unbanned and reset.", targetUser.Username))
+			// For unban, we fetch the document ID to delete it
+			docs, err := databases.ListDocuments(dbID, "users", []string{query.Equal("user_id", targetUser.ID)})
+			if err == nil && len(docs.Documents) > 0 {
+				_, err = databases.DeleteDocument(dbID, "users", docs.Documents[0].Id)
+				if err != nil {
+					Context.Error("Failed to delete user doc: " + err.Error())
+				}
+			}
+			return ephemeralResponse(Context, fmt.Sprintf("✅ User %s unbanned.", targetUser.Username))
 		}
 	}
 
 	return Context.Res.Text("Unknown interaction", Context.Res.WithStatusCode(400))
+}
+
+func upsertDocument(Context openruntimes.Context, db, col, keyVal string, data map[string]interface{}, keyName string) {
+	docs, err := databases.ListDocuments(db, col, []string{query.Equal(keyName, keyVal)})
+	if err == nil && len(docs.Documents) > 0 {
+		_, err = databases.UpdateDocument(db, col, docs.Documents[0].Id, data)
+		if err != nil {
+			Context.Error("UpdateDocument Error ["+col+"]: " + err.Error())
+		}
+	} else {
+		if err != nil && !strings.Contains(err.Error(), "404") {
+			Context.Error("ListDocuments Error ["+col+"]: " + err.Error())
+		}
+		_, err = databases.CreateDocument(db, col, "unique()", data)
+		if err != nil {
+			Context.Error("CreateDocument Error ["+col+"]: " + err.Error())
+		}
+	}
 }
 
 func ephemeralResponse(Context openruntimes.Context, msg string) openruntimes.Response {
@@ -206,26 +256,18 @@ func callGroq(prompt string) string {
 	}
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", url, strings.NewReader(string(body)))
-	req.Header.Set("Authorization", "Bearer "+groqKey)
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("GROQ_API_KEY"))
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
-		return "⚠️ Groq API Timeout"
-	}
+	if err != nil { return "⚠️ Groq Timeout" }
 	defer resp.Body.Close()
 
 	var res struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		Choices []struct { Message struct { Content string `json:"content"` } `json:"message"` } `json:"choices"`
 	}
 	json.NewDecoder(resp.Body).Decode(&res)
-	if len(res.Choices) > 0 {
-		return res.Choices[0].Message.Content
-	}
-	return "⚠️ Groq returned an error."
+	if len(res.Choices) > 0 { return res.Choices[0].Message.Content }
+	return "⚠️ Groq Error"
 }
